@@ -1,9 +1,10 @@
 """Persistência de observações ESPN em tabela independente."""
+import os
 import json
 import sqlite3
 from pathlib import Path
 
-DB_PATH = Path(__file__).resolve().parent / 'goalbot.db'
+DB_PATH = Path(os.environ.get('GOALBOT_DB_PATH') or (Path(__file__).resolve().parent / 'goalbot.db' if Path(__file__).parent.name == 'database' else Path(__file__).resolve().parents[1] / 'database' / 'goalbot.db' if Path(__file__).parent.name in ('api','analysis') else Path(__file__).resolve().parent / 'database' / 'goalbot.db'))
 
 
 def salvar_observacoes(jogos, db_path=DB_PATH):

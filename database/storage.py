@@ -1,8 +1,9 @@
 """Persistência de partidas do GOAL BOT AI em SQLite."""
+import os
 from pathlib import Path
 import sqlite3
 
-DB_PATH = Path(__file__).resolve().parent / "goalbot.db"
+DB_PATH = Path(os.environ.get('GOALBOT_DB_PATH') or (Path(__file__).resolve().parent / 'goalbot.db' if Path(__file__).parent.name == 'database' else Path(__file__).resolve().parents[1] / 'database' / 'goalbot.db' if Path(__file__).parent.name in ('api','analysis') else Path(__file__).resolve().parent / 'database' / 'goalbot.db'))
 
 
 def conectar():

@@ -1,4 +1,5 @@
 """Coleta independente de gols HT/2T via ESPN summary. Nunca decide sinais."""
+import os
 import logging
 import re
 import sqlite3
@@ -6,7 +7,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 import requests
 
-DB = Path(__file__).resolve().parent / 'database' / 'goalbot.db'
+DB = Path(os.environ.get('GOALBOT_DB_PATH') or (Path(__file__).resolve().parent / 'goalbot.db' if Path(__file__).parent.name == 'database' else Path(__file__).resolve().parents[1] / 'database' / 'goalbot.db' if Path(__file__).parent.name in ('api','analysis') else Path(__file__).resolve().parent / 'database' / 'goalbot.db'))
 BASE = 'https://site.api.espn.com/apis/site/v2/sports/soccer'
 
 

@@ -8,6 +8,7 @@ Uso:
 Fonte ESPN nao oficial. A disponibilidade e a qualidade dos dados podem variar.
 """
 
+import os
 import argparse
 import logging
 import sqlite3
@@ -19,7 +20,7 @@ from database.espn_storage import salvar_observacoes
 from goalbot_gols import coletar as coletar_gols
 
 ROOT = Path(__file__).resolve().parent
-DB = ROOT / "database" / "goalbot.db"
+DB = Path(os.environ.get('GOALBOT_DB_PATH') or (Path(__file__).resolve().parent / 'goalbot.db' if Path(__file__).parent.name == 'database' else Path(__file__).resolve().parents[1] / 'database' / 'goalbot.db' if Path(__file__).parent.name in ('api','analysis') else Path(__file__).resolve().parent / 'database' / 'goalbot.db'))
 LOG_DIR = ROOT / "logs"
 LIVE_STATUSES = {"STATUS_FIRST_HALF", "STATUS_SECOND_HALF"}
 CLOSING_STATUSES = {"STATUS_HALFTIME", "STATUS_FULL_TIME"}

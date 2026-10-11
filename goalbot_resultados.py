@@ -1,4 +1,5 @@
 """Registra sinais e atualiza resultado na mensagem original."""
+import os
 import json
 from html import escape as html_escape
 import logging
@@ -8,7 +9,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from goalbot_historico import consultar as consultar_historico
 
-DB_HISTORICO = Path(__file__).resolve().parent / "database" / "goalbot.db"
+DB_HISTORICO = Path(os.environ.get('GOALBOT_DB_PATH') or (Path(__file__).resolve().parent / 'goalbot.db' if Path(__file__).parent.name == 'database' else Path(__file__).resolve().parents[1] / 'database' / 'goalbot.db' if Path(__file__).parent.name in ('api','analysis') else Path(__file__).resolve().parent / 'database' / 'goalbot.db'))
 
 
 def numero(valor):

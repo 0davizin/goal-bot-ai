@@ -3,6 +3,7 @@
 Não é uma fonte live validada para emissão de sinais.
 """
 from __future__ import annotations
+import os
 
 import argparse
 import json
@@ -14,7 +15,7 @@ from zoneinfo import ZoneInfo
 import requests
 
 BASE_URL = "https://www.thesportsdb.com/api/v1/json/123"
-DB_PATH = Path(__file__).resolve().parents[1] / "database" / "goalbot.db"
+DB_PATH = Path(os.environ.get('GOALBOT_DB_PATH') or (Path(__file__).resolve().parent / 'goalbot.db' if Path(__file__).parent.name == 'database' else Path(__file__).resolve().parents[1] / 'database' / 'goalbot.db' if Path(__file__).parent.name in ('api','analysis') else Path(__file__).resolve().parent / 'database' / 'goalbot.db'))
 TZ = ZoneInfo("America/Sao_Paulo")
 
 

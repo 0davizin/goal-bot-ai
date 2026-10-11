@@ -21,7 +21,7 @@ from telegram.notifier import enviar_mensagem, editar_mensagem
 from monitor_global import run_once
 
 ROOT = Path(__file__).resolve().parent
-DB = ROOT / 'database' / 'goalbot.db'
+DB = Path(os.environ.get('GOALBOT_DB_PATH') or (Path(__file__).resolve().parent / 'goalbot.db' if Path(__file__).parent.name == 'database' else Path(__file__).resolve().parents[1] / 'database' / 'goalbot.db' if Path(__file__).parent.name in ('api','analysis') else Path(__file__).resolve().parent / 'database' / 'goalbot.db'))
 
 
 def rodada(limite: int) -> None:

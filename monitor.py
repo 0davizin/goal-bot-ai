@@ -1,4 +1,5 @@
 """GOAL BOT AI: monitor de coleta, sem emissão de sinais."""
+import os
 import argparse
 import logging
 import sqlite3
@@ -9,7 +10,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
-DB = ROOT / 'database' / 'goalbot.db'
+DB = Path(os.environ.get('GOALBOT_DB_PATH') or (Path(__file__).resolve().parent / 'goalbot.db' if Path(__file__).parent.name == 'database' else Path(__file__).resolve().parents[1] / 'database' / 'goalbot.db' if Path(__file__).parent.name in ('api','analysis') else Path(__file__).resolve().parent / 'database' / 'goalbot.db'))
 LOG_DIR = ROOT / 'logs'
 
 
