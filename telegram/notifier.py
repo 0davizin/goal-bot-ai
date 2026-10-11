@@ -1,5 +1,6 @@
 """Envio e edição de sinais no Telegram para o GOAL BOT AI."""
 from pathlib import Path
+import os
 import requests
 
 ENV = Path(__file__).resolve().parents[1] / '.env'
@@ -7,12 +8,13 @@ ENV = Path(__file__).resolve().parents[1] / '.env'
 
 def carregar_config():
     config = {}
-    for linha in ENV.read_text(encoding='utf-8').splitlines():
+    for linha in (ENV.read_text(encoding='utf-8').splitlines() if ENV.exists() else []):
         linha = linha.strip()
         if not linha or linha.startswith('#') or '=' not in linha:
             continue
         chave, valor = linha.split('=', 1)
         config[chave.strip()] = valor.strip().strip('"').strip("'")
+    config.update({chave: valor for chave, valor in os.environ.items() if chave in ('TELEGRAM_BOT_TOKEN', 'TELEGRAM_CHAT_ID')})
     return config
 
 
