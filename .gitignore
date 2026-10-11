@@ -1,0 +1,27 @@
+.env
+.env.*
+!.env.example
+.venv/
+venv/
+__pycache__/
+*.pyc
+*.pyo
+*.db
+*.db-*
+*.sqlite
+*.sqlite3
+*.log
+*.zip
+*.bak
+*.bak_*
+*.key
+*.pem
+*.json.bak
+.gitignore.bak
+
+# Backups e versoes antigas
+*_backup.py
+*_backup_*.py
+*_antes_*.py
+*_pre_*.py
+*.bak*
