@@ -20,19 +20,55 @@ def carregar_config():
     config.update({k: v for k, v in os.environ.items() if k in ('TELEGRAM_BOT_TOKEN', 'TELEGRAM_CHAT_ID', 'TELEGRAM_ADMIN_USER_ID')})
     return config
 
+# Serializa envios e edições entre o monitor e a thread de comandos.
+# O limite real varia conforme o chat e a API; 1,2 s é um espaçamento prudente.
+_TELEGRAM_LOCK = threading.Lock()
+_ULTIMA_REQUISICAO = 0.0
+_INTERVALO_MINIMO = 1.2
+
+
 def _chamar_telegram(metodo, payload):
+    global _ULTIMA_REQUISICAO
     config = carregar_config()
     token = config['TELEGRAM_BOT_TOKEN']
-    resposta = requests.post(
-        f'https://api.telegram.org/bot{token}/{metodo}',
-        json={'chat_id': config['TELEGRAM_CHAT_ID'], **payload},
-        timeout=15,
-    )
-    resposta.raise_for_status()
-    dados = resposta.json()
-    if not dados.get('ok'):
-        raise RuntimeError(f"Telegram recusou {metodo}: {dados.get('description', 'Erro desconhecido')}")
-    return dados['result']
+    url = f'https://api.telegram.org/bot{token}/{metodo}'
+    with _TELEGRAM_LOCK:
+        for tentativa in range(4):
+            espera = _INTERVALO_MINIMO - (time.monotonic() - _ULTIMA_REQUISICAO)
+            if espera > 0:
+                time.sleep(espera)
+            _ULTIMA_REQUISICAO = time.monotonic()
+            try:
+                resposta = requests.post(
+                    url,
+                    json={'chat_id': config['TELEGRAM_CHAT_ID'], **payload},
+                    timeout=15,
+                )
+            except requests.RequestException as exc:
+                # Nunca registrar a URL da API: ela contém o token do bot.
+                raise RuntimeError(f'Falha de rede no Telegram ({metodo}): {type(exc).__name__}') from None
+            try:
+                dados = resposta.json()
+            except ValueError:
+                dados = {}
+            if resposta.status_code == 429 or dados.get('error_code') == 429:
+                parametros = dados.get('parameters') or {}
+                try:
+                    retry_after = max(1, min(120, int(parametros.get('retry_after', 5))))
+                except (TypeError, ValueError):
+                    retry_after = 5
+                if tentativa == 3:
+                    raise RuntimeError(f'Telegram 429 em {metodo}; novas tentativas na próxima rodada')
+                logging.warning('Telegram 429 em %s; aguardando %ss antes de repetir', metodo, retry_after)
+                time.sleep(retry_after + 1)
+                continue
+            if resposta.status_code >= 400 or not dados.get('ok'):
+                descricao = str(dados.get('description', 'erro não detalhado'))
+                if metodo == 'editMessageText' and 'message is not modified' in descricao.lower():
+                    return True
+                raise RuntimeError(f'Telegram recusou {metodo}: HTTP {resposta.status_code} ({descricao})')
+            return dados['result']
+    raise RuntimeError(f'Falha inesperada na API do Telegram ({metodo})')
 
 def enviar_mensagem(texto):
     resultado = _chamar_telegram('sendMessage', {'text': texto})
@@ -60,7 +96,9 @@ def _comandos_loop(db):
             # Na primeira consulta, descartar atualizações antigas sem responder a comandos obsoletos.
             if offset is None:
                 r = requests.get(url, params={'offset': -1, 'timeout': 0, 'allowed_updates': '["message"]'}, timeout=15)
-                r.raise_for_status()
+                
+                if r.status_code >= 400:
+                    raise RuntimeError(f'Telegram getUpdates HTTP {r.status_code}')
                 payload = r.json()
                 if not payload.get('ok'):
                     raise RuntimeError(payload.get('description', 'getUpdates falhou'))
@@ -68,7 +106,8 @@ def _comandos_loop(db):
                 offset = (max(item['update_id'] for item in itens) + 1) if itens else 0
                 continue
             r = requests.get(url, params={'offset': offset, 'timeout': 20, 'allowed_updates': '["message"]'}, timeout=30)
-            r.raise_for_status()
+            if r.status_code >= 400:
+                raise RuntimeError(f'Telegram getUpdates HTTP {r.status_code}')
             payload = r.json()
             if not payload.get('ok'):
                 raise RuntimeError(payload.get('description', 'getUpdates falhou'))

@@ -283,6 +283,15 @@ def atualizar_pendentes(db, editar):
                 # Remove resultado anterior do Telegram se gol foi anulado.
                 linha_resultado = None
 
+            # Não reeditar a mensagem a cada minuto se o placar provisório
+            # permaneceu igual. O minuto exibido é o da primeira detecção.
+            if novo_status == 'CONFIRMANDO' and s['status'] == 'CONFIRMANDO' and s['resultado']:
+                anterior = str(s['resultado'])
+                placar_anterior = re.search(r'\|\s*(\d+)\s*-\s*(\d+)\s*\|', anterior)
+                if (placar_anterior and
+                    (int(placar_anterior.group(1)), int(placar_anterior.group(2))) == placar):
+                    linha_resultado = anterior
+
             if novo_status == s['status'] and linha_resultado == s['resultado']:
                 continue
             texto = html_escape(s['texto_original'])
