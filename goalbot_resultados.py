@@ -70,9 +70,40 @@ NOMES_LIGAS = {
 }
 
 
+# Cache por competição para evitar consultar a ESPN repetidamente.
+_CACHE_LIGAS = {}
+
+
+def _metadados_liga(d, row):
+    """Busca metadados oficiais no resumo ESPN apenas ao gerar novo sinal."""
+    identificador = str(d.get('league_id') or d.get('leagueId') or '').strip()
+    evento = str(row.get('id_evento') or d.get('id') or '').strip()
+    if not identificador.isdigit() or not evento.isdigit():
+        return None
+    if identificador in _CACHE_LIGAS:
+        return _CACHE_LIGAS[identificador]
+    try:
+        resposta = requests.get(
+            'https://site.api.espn.com/apis/site/v2/sports/soccer/all/summary',
+            params={'event': evento}, timeout=4,
+        )
+        resposta.raise_for_status()
+        liga = (resposta.json().get('header') or {}).get('league') or {}
+        if (isinstance(liga, dict) and str(liga.get('id')) == identificador
+                and liga.get('name') and liga.get('slug')):
+            dados = {'name': str(liga['name']), 'slug': str(liga['slug'])}
+            _CACHE_LIGAS[identificador] = dados
+            return dados
+    except (requests.RequestException, ValueError, TypeError, AttributeError) as exc:
+        logging.debug('Metadados ESPN indisponíveis para evento %s: %s', evento, type(exc).__name__)
+    return None
+
+
 def _cabecalho_liga(d, row):
     """Prefere metadados da competição; IDs numéricos não identificam países."""
     liga_dado = d.get('league') or row.get('liga') or ''
+    if str(liga_dado).strip().lower() in ('all', '', 'none') or str(liga_dado).strip().isdigit():
+        liga_dado = _metadados_liga(d, row) or liga_dado
     liga_id = str(d.get('league_id') or d.get('leagueId') or '').strip().lower()
     if isinstance(liga_dado, dict):
         liga_id = str(liga_dado.get('slug') or liga_id).strip().lower()
@@ -183,12 +214,7 @@ def registrar_sinal(db, evento, periodo, message_id, texto, linha, gols):
 
 
 def atualizar_pendentes(db, editar):
-    """Reconcilia placares, inclusive GREENs antigos que podem ter sido anulados.
-
-    O gol ao vivo é PROVISÓRIO. Somente o placar do encerramento do período
-    transforma a entrada em GREEN/RED definitivo. Uma observação posterior
-    do mesmo encerramento pode corrigir uma decisão anterior (ex.: VAR).
-    """
+    """GREEN ao atingir a linha; reversão por placar corrigido; RED ao fim."""
     with sqlite3.connect(db, timeout=15) as c:
         c.row_factory = sqlite3.Row
         sinais = c.execute("""SELECT * FROM sinais_telegram
@@ -244,53 +270,46 @@ def atualizar_pendentes(db, editar):
                 continue
 
             total = sum(placar)
-            if final:
-                novo_status = 'GREEN✅' if total > gols_inicio else 'RED❌'
-                rotulo = 'GOOL✅' if novo_status == 'GREEN✅' else 'RED❌'
-                if novo_status == 'RED❌':
-                    # Somente RED tem minuto padronizado, nunca durante o jogo.
-                    minuto_resultado = '45' if periodo == '1T' else '90'
-                else:
-                    # Preserva o minuto real do gol. Se houve VAR, utiliza o
-                    # primeiro registro da sequência positiva que permaneceu.
-                    minuto_resultado = minuto
-                    historico = c.execute("""SELECT minuto, placar_casa, placar_fora, status
-                        FROM observacoes_live
-                        WHERE id_evento=? AND coletado_em_utc>?
-                        ORDER BY id DESC LIMIT 300""",
-                        (s['id_evento'], s['criado_em'])).fetchall()
-                    sequencia = []
-                    for obs in historico:
-                        if periodo == '1T' and obs['status'] not in ('STATUS_FIRST_HALF', 'STATUS_HALFTIME'):
-                            continue
-                        if periodo == '2T' and obs['status'] not in ('STATUS_SECOND_HALF', 'STATUS_FULL_TIME'):
-                            continue
-                        oc, of = numero(obs['placar_casa']), numero(obs['placar_fora'])
-                        if oc is None or of is None:
-                            continue
-                        if oc + of <= gols_inicio:
-                            break
-                        sequencia.append(obs['minuto'])
-                    if sequencia:
-                        minuto_resultado = sequencia[-1]
-                linha_resultado = f"🎖️ Resultado: {minuto_resultado} | {placar[0]} - {placar[1]} | {rotulo}"
-            elif total > gols_inicio:
-                novo_status = 'CONFIRMANDO'
-                linha_resultado = (f"⏳ Gol em confirmação: {minuto} | "
-                                   f"{placar[0]} - {placar[1]} | Aguardando validação")
+            if total > gols_inicio:
+                # GREEN na primeira observação ESPN que ultrapassa o placar
+                # da entrada; permanece reversível se o placar for corrigido.
+                novo_status = 'GREEN✅'
+                minuto_resultado = minuto
+                historico = c.execute("""SELECT minuto, placar_casa, placar_fora, status
+                    FROM observacoes_live
+                    WHERE id_evento=? AND coletado_em_utc>?
+                    ORDER BY id DESC LIMIT 300""",
+                    (s['id_evento'], s['criado_em'])).fetchall()
+                sequencia = []
+                for obs in historico:
+                    if periodo == '1T' and obs['status'] not in ('STATUS_FIRST_HALF', 'STATUS_HALFTIME'):
+                        continue
+                    if periodo == '2T' and obs['status'] not in ('STATUS_SECOND_HALF', 'STATUS_FULL_TIME'):
+                        continue
+                    oc, of = numero(obs['placar_casa']), numero(obs['placar_fora'])
+                    if oc is None or of is None:
+                        continue
+                    if oc + of <= gols_inicio:
+                        break
+                    sequencia.append(obs['minuto'])
+                if sequencia:
+                    minuto_resultado = sequencia[-1]
+                # Se o histórico foi truncado, preservar o minuto já publicado.
+                if s['status'] == 'GREEN✅' and s['resultado']:
+                    anterior = re.search(r'^🎖️ Resultado: ([^|]+)\|', str(s['resultado']))
+                    if anterior and (not sequencia or len(historico) >= 300):
+                        minuto_resultado = anterior.group(1).strip()
+                linha_resultado = (f"🎖️ Resultado: {minuto_resultado} | "
+                                   f"{placar[0]} - {placar[1]} | GOOL✅")
+            elif final:
+                novo_status = 'RED❌'
+                minuto_resultado = '45' if periodo == '1T' else '90'
+                linha_resultado = (f"🎖️ Resultado: {minuto_resultado} | "
+                                   f"{placar[0]} - {placar[1]} | RED❌")
             else:
                 novo_status = 'PENDENTE'
-                # Remove resultado anterior do Telegram se gol foi anulado.
+                # Se a ESPN reverteu o gol (inclusive VAR), retirar o GREEN.
                 linha_resultado = None
-
-            # Não reeditar a mensagem a cada minuto se o placar provisório
-            # permaneceu igual. O minuto exibido é o da primeira detecção.
-            if novo_status == 'CONFIRMANDO' and s['status'] == 'CONFIRMANDO' and s['resultado']:
-                anterior = str(s['resultado'])
-                placar_anterior = re.search(r'\|\s*(\d+)\s*-\s*(\d+)\s*\|', anterior)
-                if (placar_anterior and
-                    (int(placar_anterior.group(1)), int(placar_anterior.group(2))) == placar):
-                    linha_resultado = anterior
 
             if novo_status == s['status'] and linha_resultado == s['resultado']:
                 continue
