@@ -52,7 +52,6 @@ def formatar_entrada(row, periodo):
         fc, ac, ec, ff, af, ef = estatisticas
         gols = gols_casa + gols_fora
         linha = gols + 0.5
-        mercado = 'Gol HT' if periodo == '1T' else 'Over Limite'
         liga = d.get('league') or row.get('liga') or ''
         codigos = {'usa.1': 'Major League Soccer (MLS)',
                    'mex.1': 'Liga MX', 'eng.1': 'Premier League',
@@ -68,16 +67,13 @@ def formatar_entrada(row, periodo):
                 liga = 'Major League Soccer (MLS)'
             elif times == {'atlas', 'guadalajara'}:
                 liga = 'Liga MX'
-        historico = consultar_historico(DB_HISTORICO, row['id_evento'], periodo, linha, nome_casa, nome_fora)
         cabecalho = f'🏆 {liga}\n' if liga else ''
         texto = (f"{cabecalho}{nome_casa} x {nome_fora}\n\n"
-
                  f"⏱️ {minuto}   |  {gols_casa} - {gols_fora}\n\n"
                  f"🎯 Over {linha:.1f}\n💎 Odd mínima 1.50\n\n"
                  f"👟 Finalizações | {fc} - {ff}\n"
                  f"🎯 No alvo | {ac} - {af}\n"
-                 f"⛳ Escanteio | {ec} - {ef}\n"
-                 f"📍 {mercado} | {historico}")
+                 f"⛳ Escanteio | {ec} - {ef}")
         return texto, linha, gols
     except (KeyError, TypeError, ValueError, json.JSONDecodeError):
         return None, None, None
@@ -105,7 +101,6 @@ def atualizar_pendentes(db, editar):
             gc, gf = numero(atual['placar_casa']), numero(atual['placar_fora'])
             if gc is None or gf is None:
                 continue
-            # Somente observações posteriores ao sinal; não reclassificar com dados antigos.
             try:
                 coletado = datetime.fromisoformat(atual['coletado_em_utc'].replace('Z', '+00:00'))
                 enviado = datetime.fromisoformat(s['criado_em'].replace('Z', '+00:00'))
@@ -116,7 +111,6 @@ def atualizar_pendentes(db, editar):
             status, minuto = atual['status'], atual['minuto']
             total = gc + gf
             if s['periodo'] == '1T':
-                # Um gol no 2T nao pode transformar um sinal HT em GREEN.
                 if status in ('STATUS_FIRST_HALF', 'STATUS_HALFTIME'):
                     if total > s['gols_inicio']:
                         rotulo = 'GREEN✅'
@@ -125,10 +119,8 @@ def atualizar_pendentes(db, editar):
                     else:
                         continue
                 elif status in ('STATUS_SECOND_HALF', 'STATUS_FULL_TIME') and total <= s['gols_inicio']:
-                    # Sem gol ate o 2T: RED do HT e inequivoco.
                     rotulo = 'RED❌'
                 else:
-                    # Sem snapshot do intervalo, nao sabemos quando saiu o gol.
                     continue
             elif s['periodo'] == '2T':
                 if total > s['gols_inicio']:
@@ -139,7 +131,8 @@ def atualizar_pendentes(db, editar):
                     continue
             else:
                 continue
-            linha_resultado = f"🎖️ Resultado: {minuto} {gc}-{gf} {rotulo}"
+            rotulo_visual = 'GOOL✅' if rotulo == 'GREEN✅' else rotulo
+            linha_resultado = f"🎖️ Resultado: {minuto} | {gc} - {gf} | {rotulo_visual}"
             try:
                 editar(s['message_id'], html_escape(s['texto_original']) + '\n\n<b>' + html_escape(linha_resultado) + '</b>')
             except Exception:
