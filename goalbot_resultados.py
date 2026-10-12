@@ -141,3 +141,57 @@ def atualizar_pendentes(db, editar):
             c.execute("UPDATE sinais_telegram SET status=?, resultado=? WHERE id_evento=? AND periodo=?",
                       (rotulo, linha_resultado, s['id_evento'], s['periodo']))
             c.commit()
+
+
+def relatorio_status(db, periodo='dia'):
+    """Relatório por data de envio, fuso America/Sao_Paulo; retorno simulado."""
+    from datetime import timedelta
+    from zoneinfo import ZoneInfo
+    agora = datetime.now(ZoneInfo('America/Sao_Paulo'))
+    if periodo == 'dia':
+        inicio = agora.replace(hour=0, minute=0, second=0, microsecond=0)
+        fim = inicio + timedelta(days=1)
+        titulo = 'DIÁRIO | ' + inicio.strftime('%d/%m/%Y')
+    elif periodo == 'mes':
+        inicio = agora.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+        fim = inicio.replace(year=inicio.year + 1, month=1) if inicio.month == 12 else inicio.replace(month=inicio.month + 1)
+        titulo = 'MENSAL | ' + inicio.strftime('%m/%Y')
+    elif periodo == 'geral':
+        inicio, fim = None, None
+        titulo = 'GERAL | HISTÓRICO'
+    else:
+        raise ValueError('Período inválido')
+    with sqlite3.connect(db, timeout=15) as c:
+        if inicio is None:
+            linhas = c.execute('SELECT status FROM sinais_telegram').fetchall()
+        else:
+            linhas = c.execute(
+                'SELECT status FROM sinais_telegram WHERE criado_em >= ? AND criado_em < ?',
+                (inicio.astimezone(timezone.utc).isoformat(), fim.astimezone(timezone.utc).isoformat())
+            ).fetchall()
+    total = len(linhas)
+    green = sum(1 for (s,) in linhas if str(s).startswith('GREEN'))
+    red = sum(1 for (s,) in linhas if str(s).startswith('RED'))
+    pendentes = total - green - red
+    resolvidas = green + red
+    margem = 100 * green / resolvidas if resolvidas else 0
+    stake = 10.0
+    odd = 1.50
+    lucro = green * stake * (odd - 1) - red * stake
+    apostado = resolvidas * stake
+    roi = 100 * lucro / apostado if apostado else 0
+    def reais(n):
+        return 'R$ ' + f'{n:,.2f}'.replace(',', 'X').replace('.', ',').replace('X', '.')
+    return (f'📊 GOAL BOT AI | {titulo}\n\n'
+            f'🎫 Entradas: {total}\n'
+            f'🤑 Green: {green}\n'
+            f'🥴 Red: {red}\n'
+            f'⏳ Pendentes: {pendentes}\n'
+            f'📍 Margem: {margem:.2f}%\n'
+            f'💰 Sobre banca: {reais(100 + lucro)}\n'
+            f'💲 ROI: {roi:+.2f}%\n'
+            f'💵 Lucro líquido: {reais(lucro)}\n'
+            f'📈 Total apostado: {reais(apostado)}\n\n'
+            '🧮 Simulação: R$ 10/entrada, odd fixa 1,50.\n'
+            'Banca-base R$ 100; não representa saldo real.\n'
+            'Margem calculada somente sobre entradas resolvidas.')
