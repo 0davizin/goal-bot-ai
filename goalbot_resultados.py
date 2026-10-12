@@ -5,6 +5,7 @@ from html import escape as html_escape
 import logging
 import re
 import sqlite3
+import requests
 from datetime import datetime, timezone
 from pathlib import Path
 from goalbot_historico import consultar as consultar_historico
@@ -36,6 +37,110 @@ def inicializar(db):
             PRIMARY KEY(id_evento, periodo))""")
 
 
+# A ESPN não garante odds live para todos os campeonatos.
+# Nunca converter odds pré-jogo em odds ao vivo.
+PAISES = {
+    'mex': ('🇲🇽', 'MÉXICO'), 'usa': ('🇺🇸', 'ESTADOS UNIDOS'),
+    'eng': ('🏴', 'INGLATERRA'), 'esp': ('🇪🇸', 'ESPANHA'),
+    'ger': ('🇩🇪', 'ALEMANHA'), 'ita': ('🇮🇹', 'ITÁLIA'),
+    'fra': ('🇫🇷', 'FRANÇA'), 'bra': ('🇧🇷', 'BRASIL'),
+    'arg': ('🇦🇷', 'ARGENTINA'), 'por': ('🇵🇹', 'PORTUGAL'),
+    'ned': ('🇳🇱', 'HOLANDA'), 'bel': ('🇧🇪', 'BÉLGICA'),
+    'tur': ('🇹🇷', 'TURQUIA'), 'sco': ('🏴', 'ESCÓCIA'),
+    'col': ('🇨🇴', 'COLÔMBIA'), 'uru': ('🇺🇾', 'URUGUAI'),
+    'chi': ('🇨🇱', 'CHILE'), 'per': ('🇵🇪', 'PERU'),
+    'ecu': ('🇪🇨', 'EQUADOR'), 'jpn': ('🇯🇵', 'JAPÃO'),
+    'kor': ('🇰🇷', 'COREIA DO SUL'), 'aus': ('🇦🇺', 'AUSTRÁLIA'),
+    'ksa': ('🇸🇦', 'ARÁBIA SAUDITA'), 'sa': ('🌎', 'AMÉRICA DO SUL'),
+    'uefa': ('🌍', 'EUROPA'), 'concacaf': ('🌎', 'CONCACAF'),
+    'afc': ('🌏', 'ÁSIA'), 'caf': ('🌍', 'ÁFRICA'),
+    'fifa': ('🌍', 'INTERNACIONAL'),
+}
+NOMES_LIGAS = {
+    'usa.1': 'MAJOR LEAGUE SOCCER (MLS)', 'mex.1': 'LIGA MX',
+    'eng.1': 'PREMIER LEAGUE', 'esp.1': 'LALIGA',
+    'ger.1': 'BUNDESLIGA', 'ita.1': 'SERIE A',
+    'fra.1': 'LIGUE 1', 'bra.1': 'BRASILEIRÃO SÉRIE A',
+    'arg.1': 'PRIMERA DIVISIÓN', 'por.1': 'PRIMEIRA LIGA',
+    'uefa.champions': 'CHAMPIONS LEAGUE',
+    'uefa.europa': 'EUROPA LEAGUE',
+    'conmebol.libertadores': 'COPA LIBERTADORES',
+    'conmebol.sudamericana': 'COPA SUL-AMERICANA',
+}
+
+
+def _cabecalho_liga(d, row):
+    liga_dado = d.get('league') or row.get('liga') or ''
+    liga_id = str(d.get('league_id') or d.get('leagueId') or '').strip().lower()
+    if isinstance(liga_dado, dict):
+        liga_id = liga_id or str(liga_dado.get('slug') or liga_dado.get('id') or '').lower()
+        liga_dado = liga_dado.get('displayName') or liga_dado.get('name') or ''
+    liga_str = str(liga_dado).strip()
+    if liga_str.lower() in ('all', 'campeonato não identificado', 'none'):
+        liga_str = ''
+    if not liga_id and liga_str.lower() in NOMES_LIGAS:
+        liga_id = liga_str.lower()
+    nome = NOMES_LIGAS.get(liga_id) or NOMES_LIGAS.get(liga_str.lower()) or liga_str.upper()
+    if not nome:
+        nome = liga_id.upper() if liga_id else 'COMPETIÇÃO NÃO IDENTIFICADA'
+    if 'libertadores' in liga_id or 'sudamericana' in liga_id or liga_id.startswith('conmebol'):
+        bandeira, pais = '🌎', 'AMÉRICA DO SUL'
+    elif liga_id.startswith('uefa.'):
+        bandeira, pais = '🌍', 'EUROPA'
+    else:
+        codigo = liga_id.split('.')[0] if liga_id else ''
+        bandeira, pais = PAISES.get(codigo, ('🌍', 'INTERNACIONAL'))
+    return f'{bandeira} {nome} - {pais}'
+
+
+def _odd_live_espn(d, row, linha):
+    """Consulta cotação ESPN em TESTE, sem presumir disponibilidade ao vivo.
+
+    Aceita somente o Over do total de gols da partida, com linha idêntica
+    à recomendada. A ESPN pode devolver odds de pré-jogo no campo `current`.
+    """
+    liga_id = str(d.get('league_id') or d.get('leagueId') or '').strip().lower()
+    liga = d.get('league')
+    if not liga_id and isinstance(liga, dict):
+        liga_id = str(liga.get('slug') or liga.get('id') or '').strip().lower()
+    evento = str(row.get('id_evento') or d.get('id') or '').strip()
+    if not re.fullmatch(r'[a-z0-9_.-]+', liga_id) or not re.fullmatch(r'\d+', evento):
+        return None
+    url = (f'https://sports.core.api.espn.com/v2/sports/soccer/leagues/{liga_id}'
+           f'/events/{evento}/competitions/{evento}/odds')
+    try:
+        resposta = requests.get(url, timeout=4, headers={'Accept': 'application/json'})
+        resposta.raise_for_status()
+        payload = resposta.json()
+    except (requests.RequestException, ValueError) as exc:
+        logging.debug('Odds ESPN indisponíveis para %s: %s', evento, exc)
+        return None
+    if not isinstance(payload, dict):
+        return None
+    for item in payload.get('items', []):
+        if not isinstance(item, dict):
+            continue
+        atual = item.get('current')
+        if not isinstance(atual, dict):
+            continue
+        total = atual.get('total')
+        if not isinstance(total, dict):
+            continue
+        try:
+            linha_espn = float(total.get('american') or total.get('alternateDisplayValue'))
+            if abs(linha_espn - float(linha)) > 0.001:
+                continue
+            over = atual.get('over')
+            if not isinstance(over, dict):
+                continue
+            odd = float(over['decimal'])
+            if 1.01 <= odd <= 100.0:
+                return odd
+        except (ValueError, TypeError, KeyError, OverflowError):
+            continue
+    return None
+
+
 def formatar_entrada(row, periodo):
     try:
         d = json.loads(row['json_original'])
@@ -52,28 +157,16 @@ def formatar_entrada(row, periodo):
         fc, ac, ec, ff, af, ef = estatisticas
         gols = gols_casa + gols_fora
         linha = gols + 0.5
-        liga = d.get('league') or row.get('liga') or ''
-        codigos = {'usa.1': 'Major League Soccer (MLS)',
-                   'mex.1': 'Liga MX', 'eng.1': 'Premier League',
-                   'esp.1': 'LaLiga', 'ger.1': 'Bundesliga',
-                   'ita.1': 'Serie A', 'fra.1': 'Ligue 1'}
-        liga_id = str(d.get('league_id') or '').strip().lower()
-        liga = codigos.get(str(liga).strip().lower(), liga)
-        if str(liga).strip().lower() in ('', 'all', 'campeonato não identificado'):
-            liga = codigos.get(liga_id, '')
-        if not liga:
-            times = {str(nome_casa).strip().lower(), str(nome_fora).strip().lower()}
-            if times == {'colorado rapids', 'san jose earthquakes'}:
-                liga = 'Major League Soccer (MLS)'
-            elif times == {'atlas', 'guadalajara'}:
-                liga = 'Liga MX'
-        cabecalho = f'🏆 {liga}\n' if liga else ''
-        texto = (f"{cabecalho}{nome_casa} x {nome_fora}\n\n"
-                 f"⏱️ {minuto}   |  {gols_casa} - {gols_fora}\n\n"
-                 f"🎯 Over {linha:.1f}\n💎 Odd mínima 1.50\n\n"
-                 f"👟 Finalizações | {fc} - {ff}\n"
-                 f"🎯 No alvo | {ac} - {af}\n"
-                 f"⛳ Escanteio | {ec} - {ef}")
+        cabecalho = _cabecalho_liga(d, row)
+        odd = _odd_live_espn(d, row, linha)
+        linha_odd = (f'🧪 Odd ESPN em teste: {odd:.2f} (não confirmada ao vivo)\n💎 Odd mínima recomendada: 1.50'
+                     if odd is not None else '💎 Odd mínima recomendada: 1.50')
+        texto = (f'{cabecalho}\n{nome_casa} x {nome_fora}\n\n'
+                 f'⏱️ {minuto}   |  {gols_casa} - {gols_fora}\n\n'
+                 f'🎯 Over {linha:.1f}\n{linha_odd}\n\n'
+                 f'👟 Finalizações | {fc} - {ff}\n'
+                 f'🎯 No alvo | {ac} - {af}\n'
+                 f'⛳ Escanteio | {ec} - {ef}')
         return texto, linha, gols
     except (KeyError, TypeError, ValueError, json.JSONDecodeError):
         return None, None, None
