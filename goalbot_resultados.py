@@ -59,6 +59,7 @@ PAISES = {
 NOMES_LIGAS = {
     'usa.1': 'MAJOR LEAGUE SOCCER (MLS)', 'mex.1': 'LIGA MX',
     'eng.1': 'PREMIER LEAGUE', 'esp.1': 'LALIGA',
+    'esp.2': 'LALIGA HYPERMOTION (SEGUNDA DIVISIÓN)',
     'ger.1': 'BUNDESLIGA', 'ita.1': 'SERIE A',
     'fra.1': 'LIGUE 1', 'bra.1': 'BRASILEIRÃO SÉRIE A',
     'arg.1': 'PRIMERA DIVISIÓN', 'por.1': 'PRIMEIRA LIGA',
@@ -70,27 +71,26 @@ NOMES_LIGAS = {
 
 
 def _cabecalho_liga(d, row):
+    """Prefere metadados da competição; IDs numéricos não identificam países."""
     liga_dado = d.get('league') or row.get('liga') or ''
     liga_id = str(d.get('league_id') or d.get('leagueId') or '').strip().lower()
     if isinstance(liga_dado, dict):
-        liga_id = liga_id or str(liga_dado.get('slug') or liga_dado.get('id') or '').lower()
+        liga_id = str(liga_dado.get('slug') or liga_id).strip().lower()
         liga_dado = liga_dado.get('displayName') or liga_dado.get('name') or ''
-    liga_str = str(liga_dado).strip()
-    if liga_str.lower() in ('all', 'campeonato não identificado', 'none'):
-        liga_str = ''
-    if not liga_id and liga_str.lower() in NOMES_LIGAS:
-        liga_id = liga_str.lower()
-    nome = NOMES_LIGAS.get(liga_id) or NOMES_LIGAS.get(liga_str.lower()) or liga_str.upper()
+    nome_bruto = str(liga_dado).strip()
+    if nome_bruto.lower() in ('all', 'none', 'campeonato não identificado') or nome_bruto.isdigit():
+        nome_bruto = ''
+    nome = NOMES_LIGAS.get(liga_id) or NOMES_LIGAS.get(nome_bruto.lower()) or nome_bruto.upper()
     if not nome:
-        nome = liga_id.upper() if liga_id else 'COMPETIÇÃO NÃO IDENTIFICADA'
-    if 'libertadores' in liga_id or 'sudamericana' in liga_id or liga_id.startswith('conmebol'):
+        nome = 'COMPETIÇÃO NÃO IDENTIFICADA'
+    if liga_id.startswith('conmebol') or 'libertadores' in liga_id or 'sudamericana' in liga_id:
         bandeira, pais = '🌎', 'AMÉRICA DO SUL'
     elif liga_id.startswith('uefa.'):
         bandeira, pais = '🌍', 'EUROPA'
     else:
-        codigo = liga_id.split('.')[0] if liga_id else ''
-        bandeira, pais = PAISES.get(codigo, ('🌍', 'INTERNACIONAL'))
-    return f'{bandeira} {nome} - {pais}'
+        codigo = liga_id.split('.')[0]
+        bandeira, pais = PAISES.get(codigo, ('🏆', ''))
+    return f'{bandeira} {nome}' + (f' - {pais}' if pais else '')
 
 
 def _odd_live_espn(d, row, linha):
@@ -183,56 +183,119 @@ def registrar_sinal(db, evento, periodo, message_id, texto, linha, gols):
 
 
 def atualizar_pendentes(db, editar):
-    with sqlite3.connect(db) as c:
+    """Reconcilia placares, inclusive GREENs antigos que podem ter sido anulados.
+
+    O gol ao vivo é PROVISÓRIO. Somente o placar do encerramento do período
+    transforma a entrada em GREEN/RED definitivo. Uma observação posterior
+    do mesmo encerramento pode corrigir uma decisão anterior (ex.: VAR).
+    """
+    with sqlite3.connect(db, timeout=15) as c:
         c.row_factory = sqlite3.Row
-        pendentes = c.execute("SELECT * FROM sinais_telegram WHERE status='PENDENTE'").fetchall()
-        for s in pendentes:
+        sinais = c.execute("""SELECT * FROM sinais_telegram
+            WHERE status IN ('PENDENTE', 'CONFIRMANDO', 'GREEN✅', 'RED❌')""").fetchall()
+        for s in sinais:
+            # A observação mais recente pode corrigir um placar anterior.
             atual = c.execute("""SELECT * FROM observacoes_live
                 WHERE id_evento=? ORDER BY id DESC LIMIT 1""", (s['id_evento'],)).fetchone()
-            if not atual:
+            if atual is None:
                 continue
             gc, gf = numero(atual['placar_casa']), numero(atual['placar_fora'])
             if gc is None or gf is None:
                 continue
             try:
-                coletado = datetime.fromisoformat(atual['coletado_em_utc'].replace('Z', '+00:00'))
-                enviado = datetime.fromisoformat(s['criado_em'].replace('Z', '+00:00'))
+                coletado = datetime.fromisoformat(str(atual['coletado_em_utc']).replace('Z', '+00:00'))
+                enviado = datetime.fromisoformat(str(s['criado_em']).replace('Z', '+00:00'))
                 if coletado <= enviado:
                     continue
             except (ValueError, TypeError):
                 continue
-            status, minuto = atual['status'], atual['minuto']
-            total = gc + gf
-            if s['periodo'] == '1T':
-                if status in ('STATUS_FIRST_HALF', 'STATUS_HALFTIME'):
-                    if total > s['gols_inicio']:
-                        rotulo = 'GREEN✅'
-                    elif status == 'STATUS_HALFTIME':
-                        rotulo = 'RED❌'
-                    else:
+
+            status = str(atual['status'])
+            periodo = s['periodo']
+            minuto = atual['minuto']
+            gols_inicio = s['gols_inicio']
+            final = False
+            if periodo == '1T':
+                # Não utilizar placar do 2T para liquidar entrada do 1T.
+                if status == 'STATUS_FIRST_HALF':
+                    placar = (gc, gf)
+                else:
+                    ht = c.execute("""SELECT * FROM observacoes_live
+                        WHERE id_evento=? AND status='STATUS_HALFTIME'
+                        ORDER BY id DESC LIMIT 1""", (s['id_evento'],)).fetchone()
+                    if ht is None:
+                        # Sem placar de intervalo verificável: não inventar resultado.
                         continue
-                elif status in ('STATUS_SECOND_HALF', 'STATUS_FULL_TIME') and total <= s['gols_inicio']:
-                    rotulo = 'RED❌'
-                else:
+                    hc, hf = numero(ht['placar_casa']), numero(ht['placar_fora'])
+                    if hc is None or hf is None:
+                        continue
+                    placar = (hc, hf)
+                    minuto = ht['minuto']
+                    final = True
+                if status == 'STATUS_HALFTIME':
+                    placar = (gc, gf)
+                    final = True
+            elif periodo == '2T':
+                if status not in ('STATUS_SECOND_HALF', 'STATUS_FULL_TIME'):
                     continue
-            elif s['periodo'] == '2T':
-                if total > s['gols_inicio']:
-                    rotulo = 'GREEN✅'
-                elif status == 'STATUS_FULL_TIME':
-                    rotulo = 'RED❌'
-                else:
-                    continue
+                placar = (gc, gf)
+                final = status == 'STATUS_FULL_TIME'
             else:
                 continue
-            rotulo_visual = 'GOOL✅' if rotulo == 'GREEN✅' else rotulo
-            linha_resultado = f"🎖️ Resultado: {minuto} | {gc} - {gf} | {rotulo_visual}"
-            try:
-                editar(s['message_id'], html_escape(s['texto_original']) + '\n\n<b>' + html_escape(linha_resultado) + '</b>')
-            except Exception:
-                logging.exception('Falha ao editar mensagem do evento %s', s['id_evento'])
+
+            total = sum(placar)
+            if final:
+                novo_status = 'GREEN✅' if total > gols_inicio else 'RED❌'
+                rotulo = 'GOOL✅' if novo_status == 'GREEN✅' else 'RED❌'
+                if novo_status == 'RED❌':
+                    # Somente RED tem minuto padronizado, nunca durante o jogo.
+                    minuto_resultado = '45' if periodo == '1T' else '90'
+                else:
+                    # Preserva o minuto real do gol. Se houve VAR, utiliza o
+                    # primeiro registro da sequência positiva que permaneceu.
+                    minuto_resultado = minuto
+                    historico = c.execute("""SELECT minuto, placar_casa, placar_fora, status
+                        FROM observacoes_live
+                        WHERE id_evento=? AND coletado_em_utc>?
+                        ORDER BY id DESC LIMIT 300""",
+                        (s['id_evento'], s['criado_em'])).fetchall()
+                    sequencia = []
+                    for obs in historico:
+                        if periodo == '1T' and obs['status'] not in ('STATUS_FIRST_HALF', 'STATUS_HALFTIME'):
+                            continue
+                        if periodo == '2T' and obs['status'] not in ('STATUS_SECOND_HALF', 'STATUS_FULL_TIME'):
+                            continue
+                        oc, of = numero(obs['placar_casa']), numero(obs['placar_fora'])
+                        if oc is None or of is None:
+                            continue
+                        if oc + of <= gols_inicio:
+                            break
+                        sequencia.append(obs['minuto'])
+                    if sequencia:
+                        minuto_resultado = sequencia[-1]
+                linha_resultado = f"🎖️ Resultado: {minuto_resultado} | {placar[0]} - {placar[1]} | {rotulo}"
+            elif total > gols_inicio:
+                novo_status = 'CONFIRMANDO'
+                linha_resultado = (f"⏳ Gol em confirmação: {minuto} | "
+                                   f"{placar[0]} - {placar[1]} | Aguardando validação")
+            else:
+                novo_status = 'PENDENTE'
+                # Remove resultado anterior do Telegram se gol foi anulado.
+                linha_resultado = None
+
+            if novo_status == s['status'] and linha_resultado == s['resultado']:
                 continue
-            c.execute("UPDATE sinais_telegram SET status=?, resultado=? WHERE id_evento=? AND periodo=?",
-                      (rotulo, linha_resultado, s['id_evento'], s['periodo']))
+            texto = html_escape(s['texto_original'])
+            if linha_resultado:
+                texto += '\n\n<b>' + html_escape(linha_resultado) + '</b>'
+            try:
+                editar(s['message_id'], texto)
+            except Exception:
+                logging.exception('Falha ao reconciliar sinal do evento %s', s['id_evento'])
+                continue
+            c.execute("""UPDATE sinais_telegram SET status=?, resultado=?
+                WHERE id_evento=? AND periodo=?""",
+                (novo_status, linha_resultado, s['id_evento'], periodo))
             c.commit()
 
 
