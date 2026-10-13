@@ -36,6 +36,10 @@ def inicializar(db):
             criado_em TEXT NOT NULL, resultado TEXT,
             PRIMARY KEY(id_evento, periodo))""")
 
+        colunas = {r[1] for r in c.execute("PRAGMA table_info(sinais_telegram)")}
+        if 'texto_exibido' not in colunas:
+            c.execute("ALTER TABLE sinais_telegram ADD COLUMN texto_exibido TEXT")
+
 
 # A ESPN não garante odds live para todos os campeonatos.
 # Nunca converter odds pré-jogo em odds ao vivo.
@@ -213,14 +217,70 @@ def registrar_sinal(db, evento, periodo, message_id, texto, linha, gols):
             (str(evento),periodo,message_id,texto,linha,gols,datetime.now(timezone.utc).isoformat()))
 
 
+def _estatisticas_texto(original, observacao):
+    """Atualiza apenas linhas com dados completos; nunca substitui por nulos."""
+    campos = (
+        ('👟 Finalizações', 'finalizacoes_casa', 'finalizacoes_fora'),
+        ('🎯 No alvo', 'chutes_gol_casa', 'chutes_gol_fora'),
+        ('⛳ Escanteio', 'escanteios_casa', 'escanteios_fora'),
+    )
+    texto = original
+    for titulo, casa, fora in campos:
+        a, b = numero(observacao[casa]), numero(observacao[fora])
+        if a is None or b is None:
+            continue
+        padrao = rf'^{re.escape(titulo)} \| \d+ - \d+$'
+        texto = re.sub(padrao, f'{titulo} | {a} - {b}', texto, count=1, flags=re.MULTILINE)
+    return texto
+
+
+def _eventos_gol(con, sinal, periodo, placar_atual):
+    """Reconstitui transições observadas, removendo gols revertidos por VAR.
+
+    O minuto é o da primeira observação da mudança, não necessariamente
+    o minuto oficial do gol. Saltos de placar são descritos sem inventar gols.
+    """
+    origem = re.search(r'⏱️[^\n]*?\|\s*(\d+)\s*-\s*(\d+)', sinal['texto_original'])
+    if not origem:
+        return []
+    base = (int(origem.group(1)), int(origem.group(2)))
+    registros = con.execute("""SELECT minuto, status, placar_casa, placar_fora
+        FROM observacoes_live WHERE id_evento=? AND coletado_em_utc>?
+        ORDER BY id ASC""", (sinal['id_evento'], sinal['criado_em'])).fetchall()
+    permitidos = ({'STATUS_FIRST_HALF', 'STATUS_HALFTIME'} if periodo == '1T'
+                  else {'STATUS_SECOND_HALF', 'STATUS_FULL_TIME'})
+    eventos = []
+    anterior = base
+    for obs in registros:
+        if obs['status'] not in permitidos:
+            continue
+        a, b = numero(obs['placar_casa']), numero(obs['placar_fora'])
+        if a is None or b is None:
+            continue
+        placar = (a, b)
+        if placar == anterior:
+            continue
+        # Em correções de placar, descartar eventos que não existem mais.
+        if a < anterior[0] or b < anterior[1]:
+            eventos = [e for e in eventos if e['placar'][0] <= a and e['placar'][1] <= b]
+        if sum(placar) > sum(anterior) and a >= anterior[0] and b >= anterior[1]:
+            incremento = sum(placar) - sum(anterior)
+            minuto = str(obs['minuto'] or '?')
+            eventos.append({'placar': placar, 'minuto': minuto, 'quantidade': incremento})
+        anterior = placar
+    # Se a última correção chegou sem snapshot intermediário, nunca exibir
+    # evento incompatível com o placar válido da liquidação.
+    return [e for e in eventos if e['placar'][0] <= placar_atual[0]
+            and e['placar'][1] <= placar_atual[1]]
+
+
 def atualizar_pendentes(db, editar):
-    """GREEN ao atingir a linha; reversão por placar corrigido; RED ao fim."""
+    """Atualiza estatísticas e gols na mensagem original; preserva GREEN/VAR."""
     with sqlite3.connect(db, timeout=15) as c:
         c.row_factory = sqlite3.Row
         sinais = c.execute("""SELECT * FROM sinais_telegram
             WHERE status IN ('PENDENTE', 'CONFIRMANDO', 'GREEN✅', 'RED❌')""").fetchall()
         for s in sinais:
-            # A observação mais recente pode corrigir um placar anterior.
             atual = c.execute("""SELECT * FROM observacoes_live
                 WHERE id_evento=? ORDER BY id DESC LIMIT 1""", (s['id_evento'],)).fetchone()
             if atual is None:
@@ -241,8 +301,8 @@ def atualizar_pendentes(db, editar):
             minuto = atual['minuto']
             gols_inicio = s['gols_inicio']
             final = False
+            estatistica = atual
             if periodo == '1T':
-                # Não utilizar placar do 2T para liquidar entrada do 1T.
                 if status == 'STATUS_FIRST_HALF':
                     placar = (gc, gf)
                 else:
@@ -250,13 +310,13 @@ def atualizar_pendentes(db, editar):
                         WHERE id_evento=? AND status='STATUS_HALFTIME'
                         ORDER BY id DESC LIMIT 1""", (s['id_evento'],)).fetchone()
                     if ht is None:
-                        # Sem placar de intervalo verificável: não inventar resultado.
                         continue
                     hc, hf = numero(ht['placar_casa']), numero(ht['placar_fora'])
                     if hc is None or hf is None:
                         continue
                     placar = (hc, hf)
                     minuto = ht['minuto']
+                    estatistica = ht
                     final = True
                 if status == 'STATUS_HALFTIME':
                     placar = (gc, gf)
@@ -269,38 +329,27 @@ def atualizar_pendentes(db, editar):
             else:
                 continue
 
-            total = sum(placar)
-            if total > gols_inicio:
-                # GREEN na primeira observação ESPN que ultrapassa o placar
-                # da entrada; permanece reversível se o placar for corrigido.
+            eventos = _eventos_gol(c, s, periodo, placar)
+            if sum(placar) > gols_inicio:
                 novo_status = 'GREEN✅'
-                minuto_resultado = minuto
-                historico = c.execute("""SELECT minuto, placar_casa, placar_fora, status
-                    FROM observacoes_live
-                    WHERE id_evento=? AND coletado_em_utc>?
-                    ORDER BY id DESC LIMIT 300""",
-                    (s['id_evento'], s['criado_em'])).fetchall()
-                sequencia = []
-                for obs in historico:
-                    if periodo == '1T' and obs['status'] not in ('STATUS_FIRST_HALF', 'STATUS_HALFTIME'):
-                        continue
-                    if periodo == '2T' and obs['status'] not in ('STATUS_SECOND_HALF', 'STATUS_FULL_TIME'):
-                        continue
-                    oc, of = numero(obs['placar_casa']), numero(obs['placar_fora'])
-                    if oc is None or of is None:
-                        continue
-                    if oc + of <= gols_inicio:
-                        break
-                    sequencia.append(obs['minuto'])
-                if sequencia:
-                    minuto_resultado = sequencia[-1]
-                # Se o histórico foi truncado, preservar o minuto já publicado.
-                if s['status'] == 'GREEN✅' and s['resultado']:
-                    anterior = re.search(r'^🎖️ Resultado: ([^|]+)\|', str(s['resultado']))
-                    if anterior and (not sequencia or len(historico) >= 300):
-                        minuto_resultado = anterior.group(1).strip()
-                linha_resultado = (f"🎖️ Resultado: {minuto_resultado} | "
-                                   f"{placar[0]} - {placar[1]} | GOOL✅")
+                if eventos:
+                    primeiro = eventos[0]
+                    minuto_resultado = primeiro['minuto']
+                    placar_primeiro = primeiro['placar']
+                else:
+                    # Compatibilidade com sinais antigos sem histórico completo.
+                    anterior = re.search(r'^🎖️ Resultado: ([^|]+)\|', str(s['resultado'] or ''))
+                    minuto_resultado = anterior.group(1).strip() if anterior else minuto
+                    placar_primeiro = placar
+                linhas = [f"🎖️ Resultado: {minuto_resultado} | "
+                          f"{placar_primeiro[0]} - {placar_primeiro[1]} | GOOL✅"]
+                for evento in eventos[1:]:
+                    aviso = (' | múltiplos gols detectados' if evento['quantidade'] > 1 else '')
+                    linhas.append(f"⚽ {evento['minuto']} | "
+                                  f"{evento['placar'][0]} - {evento['placar'][1]} | GOOL✅{aviso}")
+                if eventos and eventos[0]['quantidade'] > 1:
+                    linhas[0] += ' | múltiplos gols detectados'
+                linha_resultado = '\n'.join(linhas)
             elif final:
                 novo_status = 'RED❌'
                 minuto_resultado = '45' if periodo == '1T' else '90'
@@ -308,23 +357,33 @@ def atualizar_pendentes(db, editar):
                                    f"{placar[0]} - {placar[1]} | RED❌")
             else:
                 novo_status = 'PENDENTE'
-                # Se a ESPN reverteu o gol (inclusive VAR), retirar o GREEN.
                 linha_resultado = None
 
-            if novo_status == s['status'] and linha_resultado == s['resultado']:
-                continue
-            texto = html_escape(s['texto_original'])
+            # A base original nunca muda. A versão enviada fica em coluna própria.
+            base = _estatisticas_texto(s['texto_original'], estatistica)
+            texto = html_escape(base)
             if linha_resultado:
                 texto += '\n\n<b>' + html_escape(linha_resultado) + '</b>'
-            try:
-                editar(s['message_id'], texto)
-            except Exception:
-                logging.exception('Falha ao reconciliar sinal do evento %s', s['id_evento'])
+            anterior_exibido = s['texto_exibido']
+            if anterior_exibido is None:
+                anterior_exibido = html_escape(s['texto_original'])
+                if s['resultado']:
+                    anterior_exibido += '\n\n<b>' + html_escape(s['resultado']) + '</b>'
+            if texto == anterior_exibido and novo_status == s['status']:
                 continue
-            c.execute("""UPDATE sinais_telegram SET status=?, resultado=?
+            if texto != anterior_exibido:
+                try:
+                    editar(s['message_id'], texto)
+                except Exception:
+                    logging.exception('Falha ao reconciliar sinal do evento %s', s['id_evento'])
+                    continue
+            c.execute("""UPDATE sinais_telegram
+                SET status=?, resultado=?, texto_exibido=?
                 WHERE id_evento=? AND periodo=?""",
-                (novo_status, linha_resultado, s['id_evento'], periodo))
+                (novo_status, linha_resultado, texto, s['id_evento'], periodo))
             c.commit()
+
+
 
 
 def relatorio_status(db, periodo='dia'):
