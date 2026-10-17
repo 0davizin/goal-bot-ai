@@ -19,6 +19,7 @@ from pathlib import Path
 from analysis.anti_duplicate import ja_enviado, registrar_envio
 from telegram.notifier import enviar_mensagem, editar_mensagem, iniciar_comandos
 from monitor_global import run_once
+from integrations.girocerto_validador import validar_odd
 
 ROOT = Path(__file__).resolve().parent
 DB = Path(os.environ.get('GOALBOT_DB_PATH') or ROOT / 'database' / 'goalbot.db')
@@ -93,6 +94,21 @@ def rodada(limite: int) -> None:
             if not texto:
                 contagem['DADOS_INCOMPLETOS'] += 1
                 continue
+            # Giro Certo: AUDITORIA (padrão) ou FILTRO explícito.
+            # Sem cotação validada, o modo filtro não envia; o modo auditoria preserva o robô.
+            modo_giro = os.getenv('GOALBOT_GIROCERTO_MODO', 'auditoria').strip().lower()
+            if modo_giro in ('auditoria', 'filtro'):
+                resultado_giro = validar_odd(dict(atual), periodo, linha)
+                logging.info('%s | GIRO CERTO | %s | %s | odd=%s',
+                             evento, modo_giro, resultado_giro.motivo, resultado_giro.odd)
+                if modo_giro == 'filtro' and not resultado_giro.aprovado:
+                    contagem['GIRO_NAO_APROVADO'] += 1
+                    continue
+                if resultado_giro.aprovado:
+                    texto += (f'\n\nGiro Certo: odd observada {resultado_giro.odd:.2f}'
+                              f' | Mercado: Over {linha:.1f} '
+                              f'{"HT" if periodo == "1T" else "FT"}'
+                              '\nCotação sujeita a alterações; bilhete não gerado.')
             if os.getenv('GOALBOT_ENVIAR','0') == '1':
                 message_id = enviar_mensagem(texto)
                 registrar_sinal(DB, evento, periodo, message_id, texto, linha, gols)
@@ -118,7 +134,8 @@ def main() -> None:
     logging.basicConfig(level=logging.INFO, format='%(asctime)s | %(levelname)s | %(message)s', stream=sys.stdout)
     logging.info('GOAL BOT AI | Monitor inteligente iniciado | intervalo=%ds | Telegram controlado por GOALBOT_ENVIAR', args.intervalo)
     if not args.uma_vez:
-        iniciar_comandos(DB)
+        if os.getenv("GOALBOT_COMANDOS_TELEGRAM", "0") == "1":
+            iniciar_comandos(DB)
     try:
         while True:
             try:
