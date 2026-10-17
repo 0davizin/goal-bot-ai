@@ -83,7 +83,7 @@ def rodada(limite: int) -> None:
                 if finalizacoes >= 3 and alvo >= 1:
                     avaliacao = {'classificacao':'BOA','novas_finalizacoes':finalizacoes,'novos_chutes_no_gol':alvo}
                     break
-            if avaliacao is None:
+            if avaliacao is None or avaliacao['classificacao'] != 'FORTE':
                 contagem['SEM_PRESSAO_CONFIRMADA'] += 1
                 continue
             if ja_enviado(evento, periodo):
